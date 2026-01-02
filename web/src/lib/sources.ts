@@ -7,6 +7,7 @@ import {
   DiscourseIcon,
   Document360Icon,
   DropboxIcon,
+  BoxIcon,
   GithubIcon,
   GitlabIcon,
   BitbucketIcon,
@@ -199,7 +200,7 @@ export const SOURCE_METADATA_MAP: SourceMap = {
     docs: `${DOCS_ADMINS_PATH}/connectors/official/dropbox`,
   },
   box: {
-    icon: DropboxIcon, // TODO: Add Box icon
+    icon: BoxIcon,
     displayName: "Box",
     category: SourceCategory.Storage,
     docs: `${DOCS_ADMINS_PATH}/connectors/official/box`,
