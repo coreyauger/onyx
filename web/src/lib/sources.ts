@@ -198,6 +198,12 @@ export const SOURCE_METADATA_MAP: SourceMap = {
     category: SourceCategory.Storage,
     docs: `${DOCS_ADMINS_PATH}/connectors/official/dropbox`,
   },
+  box: {
+    icon: DropboxIcon, // TODO: Add Box icon
+    displayName: "Box",
+    category: SourceCategory.Storage,
+    docs: `${DOCS_ADMINS_PATH}/connectors/official/box`,
+  },
   s3: {
     icon: S3Icon,
     displayName: "S3",

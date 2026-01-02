@@ -177,6 +177,14 @@ export interface DropboxCredentialJson {
   dropbox_access_token: string;
 }
 
+export interface BoxCredentialJson {
+  box_access_token: string;
+  box_refresh_token?: string;
+  box_client_id?: string;
+  box_client_secret?: string;
+  box_user_id?: string;
+}
+
 export interface R2CredentialJson {
   account_id: string;
   r2_access_key_id: string;
@@ -331,6 +339,12 @@ export const credentialTemplates: Record<ValidSources, any> = {
     loopio_client_token: "",
   } as LoopioCredentialJson,
   dropbox: { dropbox_access_token: "" } as DropboxCredentialJson,
+  box: {
+    box_access_token: "",
+    box_refresh_token: "",
+    box_client_id: "",
+    box_client_secret: "",
+  } as BoxCredentialJson,
   salesforce: {
     sf_username: "",
     sf_password: "",
