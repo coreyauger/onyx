@@ -5,14 +5,20 @@ from functools import partial
 from typing import Any
 from urllib.parse import urlparse
 
-from box_sdk_gen.client import BoxClient
-from box_sdk_gen.client import BoxDeveloperTokenAuth
-from box_sdk_gen.client import BoxOAuth
-from box_sdk_gen.exception import BoxAPIException
+from box_sdk_gen import AccessToken
+from box_sdk_gen import BoxClient
+from box_sdk_gen.box import BoxAPIError
+from box_sdk_gen.box import BoxDeveloperTokenAuth
+from box_sdk_gen.box import BoxOAuth
+from box_sdk_gen.box import OAuthConfig
 from typing_extensions import override
 
+from onyx.configs.app_configs import BOX_CLIENT_ID
+from onyx.configs.app_configs import BOX_CLIENT_SECRET
+from onyx.configs.app_configs import BOX_DEVELOPER_TOKEN
 from onyx.configs.app_configs import GOOGLE_DRIVE_CONNECTOR_SIZE_THRESHOLD
 from onyx.configs.app_configs import INDEX_BATCH_SIZE
+from onyx.configs.constants import DocumentSource
 from onyx.connectors.box.doc_conversion import build_slim_document
 from onyx.connectors.box.doc_conversion import convert_box_item_to_document
 from onyx.connectors.box.doc_conversion import onyx_document_id_from_box_file
@@ -23,6 +29,9 @@ from onyx.connectors.box.models import BoxCheckpoint
 from onyx.connectors.box.models import BoxRetrievalStage
 from onyx.connectors.box.models import RetrievedBoxFile
 from onyx.connectors.box.models import StageCompletion
+from onyx.connectors.cross_connector_utils.miscellaneous_utils import (
+    get_oauth_callback_uri,
+)
 from onyx.connectors.exceptions import ConnectorValidationError
 from onyx.connectors.exceptions import CredentialExpiredError
 from onyx.connectors.exceptions import InsufficientPermissionsError
@@ -30,6 +39,7 @@ from onyx.connectors.interfaces import CheckpointedConnectorWithPermSync
 from onyx.connectors.interfaces import CheckpointOutput
 from onyx.connectors.interfaces import GenerateSlimDocumentOutput
 from onyx.connectors.interfaces import NormalizationResult
+from onyx.connectors.interfaces import OAuthConnector
 from onyx.connectors.interfaces import SecondsSinceUnixEpoch
 from onyx.connectors.interfaces import SlimConnectorWithPermSync
 from onyx.connectors.models import ConnectorFailure
@@ -38,6 +48,7 @@ from onyx.connectors.models import Document
 from onyx.connectors.models import EntityFailure
 from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
 from onyx.utils.logger import setup_logger
+from onyx.utils.retry_wrapper import request_with_retries
 from onyx.utils.threadpool_concurrency import ThreadSafeDict
 
 logger = setup_logger()
@@ -67,7 +78,9 @@ def _extract_ids_from_urls(urls: list[str]) -> list[str]:
 
 
 class BoxConnector(
-    SlimConnectorWithPermSync, CheckpointedConnectorWithPermSync[BoxCheckpoint]
+    SlimConnectorWithPermSync,
+    CheckpointedConnectorWithPermSync[BoxCheckpoint],
+    OAuthConnector,
 ):
     def __init__(
         self,
@@ -143,32 +156,114 @@ class BoxConnector(
 
         return NormalizationResult(normalized_url=None, use_default=False)
 
+    @classmethod
+    def oauth_id(cls) -> DocumentSource:
+        return DocumentSource.BOX
+
+    @classmethod
+    def oauth_authorization_url(
+        cls, base_domain: str, state: str, additional_kwargs: dict[str, str]
+    ) -> str:
+        if not BOX_CLIENT_ID:
+            raise ValueError("BOX_CLIENT_ID environment variable must be set")
+
+        callback_uri = get_oauth_callback_uri(base_domain, DocumentSource.BOX.value)
+        return (
+            f"https://account.box.com/api/oauth2/authorize"
+            f"?client_id={BOX_CLIENT_ID}"
+            f"&redirect_uri={callback_uri}"
+            f"&response_type=code"
+            f"&scope=root_readonly"
+            f"&state={state}"
+        )
+
+    @classmethod
+    def oauth_code_to_token(
+        cls, base_domain: str, code: str, additional_kwargs: dict[str, str]
+    ) -> dict[str, Any]:
+        if not BOX_CLIENT_ID:
+            raise ValueError("BOX_CLIENT_ID environment variable must be set")
+        if not BOX_CLIENT_SECRET:
+            raise ValueError("BOX_CLIENT_SECRET environment variable must be set")
+
+        callback_uri = get_oauth_callback_uri(base_domain, DocumentSource.BOX.value)
+
+        data = {
+            "client_id": BOX_CLIENT_ID,
+            "client_secret": BOX_CLIENT_SECRET,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": callback_uri,
+        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+        response = request_with_retries(
+            method="POST",
+            url="https://api.box.com/oauth2/token",
+            data=data,
+            headers=headers,
+            backoff=0,
+            delay=0.1,
+        )
+        if not response.ok:
+            raise RuntimeError(f"Failed to exchange code for token: {response.text}")
+
+        token_data = response.json()
+
+        return {
+            "access_token": token_data["access_token"],
+            "refresh_token": token_data.get("refresh_token"),
+        }
+
     def load_credentials(self, credentials: dict[str, Any]) -> dict[str, str] | None:
         """Load Box credentials and initialize client."""
-        # Support OAuth 2.0 tokens
-        if "box_access_token" in credentials:
-            access_token = credentials["box_access_token"]
-            refresh_token = credentials.get("box_refresh_token")
-            client_id = credentials.get("box_client_id")
-            client_secret = credentials.get("box_client_secret")
+        # Support OAuth 2.0 tokens from OAuth flow
+        if "access_token" in credentials:
+            access_token = credentials["access_token"]
+            refresh_token = credentials.get("refresh_token")
 
-            if refresh_token and client_id and client_secret:
-                # Use OAuth with refresh token
-                oauth = BoxOAuth(
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    access_token=access_token,
-                    refresh_token=refresh_token,
+            # Check if BOX_DEVELOPER_TOKEN is set (overrides OAuth, for TESTING only)
+            if BOX_DEVELOPER_TOKEN:
+                logger.info(
+                    "Using BOX_DEVELOPER_TOKEN for authentication (TESTING ONLY)"
                 )
-                self._box_client = BoxClient(oauth=oauth)
-            else:
-                # Use developer token (for testing)
-                auth = BoxDeveloperTokenAuth(token=access_token)
+                auth = BoxDeveloperTokenAuth(token=BOX_DEVELOPER_TOKEN)
                 self._box_client = BoxClient(auth=auth)
+            elif refresh_token and BOX_CLIENT_ID and BOX_CLIENT_SECRET:
+                # Use OAuth with refresh token (from OAuth flow)
+                logger.info("Using OAuth authentication with refresh token")
+                oauth = BoxOAuth(
+                    OAuthConfig(
+                        client_id=BOX_CLIENT_ID,
+                        client_secret=BOX_CLIENT_SECRET,
+                    )
+                )
+                # Set the initial refresh token
+                access_token = AccessToken(
+                    accessToken=access_token, refreshToken=refresh_token
+                )
+                oauth.token_storage.store(access_token)
+                self._box_client = BoxClient(auth=oauth)
+            else:
+                # Fallback to developer token from credentials if available
+                dev_token = credentials.get("box_developer_token")
+                if dev_token:
+                    logger.info("Using developer token from credentials (TESTING ONLY)")
+                    auth = BoxDeveloperTokenAuth(token=dev_token)
+                    self._box_client = BoxClient(auth=auth)
+                else:
+                    raise ConnectorValidationError(
+                        "Box credentials incomplete. Need either BOX_DEVELOPER_TOKEN env var, "
+                        "OAuth credentials (refresh_token with BOX_CLIENT_ID and BOX_CLIENT_SECRET), "
+                        "or box_developer_token in credentials."
+                    )
 
             # Get current user info
             try:
                 current_user = self._box_client.users.get_user_me()
+                logger.debug(
+                    f"Box authentication successful for user: {current_user.id}"
+                )
                 self._user_id = current_user.id
             except Exception as e:
                 logger.warning(f"Could not get current user info: {e}")
@@ -176,13 +271,20 @@ class BoxConnector(
 
         elif "box_developer_token" in credentials:
             # Developer token authentication (for testing)
-            auth = BoxDeveloperTokenAuth(token=credentials["box_developer_token"])
+            # Note: BOX_DEVELOPER_TOKEN env var takes precedence if set
+            if BOX_DEVELOPER_TOKEN:
+                logger.info(
+                    "Using BOX_DEVELOPER_TOKEN for authentication (TESTING ONLY)"
+                )
+                auth = BoxDeveloperTokenAuth(token=BOX_DEVELOPER_TOKEN)
+            else:
+                logger.info("Using developer token from credentials (TESTING ONLY)")
+                auth = BoxDeveloperTokenAuth(token=credentials["box_developer_token"])
             self._box_client = BoxClient(auth=auth)
             self._user_id = credentials.get("box_user_id", "me")
         else:
             raise ConnectorValidationError(
-                "Box credentials missing. Need either 'box_access_token' "
-                "or 'box_developer_token'."
+                "Box credentials missing. Need either 'access_token' (from OAuth flow), "
             )
 
         self._creds_dict = credentials
@@ -521,7 +623,7 @@ class BoxConnector(
             current_user = self._box_client.users.get_user_me()
             logger.info(f"Box connector validated for user: {current_user.name}")
 
-        except BoxAPIException as e:
+        except BoxAPIError as e:
             status_code = e.status_code if hasattr(e, "status_code") else None
             if status_code == 401:
                 raise CredentialExpiredError(

@@ -178,10 +178,12 @@ export interface DropboxCredentialJson {
 }
 
 export interface BoxCredentialJson {
-  box_access_token: string;
+  // OAuth flow credentials
+  access_token?: string;
+  refresh_token?: string;
+  // Legacy credentials (for backward compatibility)
+  box_access_token?: string;
   box_refresh_token?: string;
-  box_client_id?: string;
-  box_client_secret?: string;
   box_user_id?: string;
 }
 
@@ -340,10 +342,8 @@ export const credentialTemplates: Record<ValidSources, any> = {
   } as LoopioCredentialJson,
   dropbox: { dropbox_access_token: "" } as DropboxCredentialJson,
   box: {
-    box_access_token: "",
-    box_refresh_token: "",
-    box_client_id: "",
-    box_client_secret: "",
+    access_token: "",
+    refresh_token: "",
   } as BoxCredentialJson,
   salesforce: {
     sf_username: "",
